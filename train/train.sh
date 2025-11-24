@@ -115,6 +115,7 @@ deepspeed --hostfile=$HOST_PATH --master_addr $CHIEF_IP train.py \
     --use_pack_kv \
     --use_torch_rmsnorm \
     --use_swish_glu \
+    --use_fused_rope \
     --bf16 | tee ${log_file}
 
 

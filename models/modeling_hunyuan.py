@@ -632,6 +632,7 @@ class HunYuanAttention(nn.Module):
         self.use_qk_norm = config.use_qk_norm
         self.use_pack_kv = config.use_pack_kv
         self.use_torch_rmsnorm = config.use_torch_rmsnorm
+        self.use_fused_rope = config.use_fused_rope
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -657,13 +658,15 @@ class HunYuanAttention(nn.Module):
         if self.use_qk_norm:
             self.query_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
             self.key_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
-        self._init_rope()
-        self.t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
-        self.inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        self.inv_freq = self.inv_freq.bfloat16()
-        self.freqs = torch.outer(self.t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        self.emb = torch.cat((self.freqs, self.freqs), dim=-1).float()
+        if self.use_fused_rope and self.training:
+            self.t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
+            self.inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.inv_freq = self.inv_freq.bfloat16()
+            self.freqs = torch.outer(self.t, self.inv_freq)
+            # Different from paper, but it uses a different permutation in order to obtain the same calculation
+            self.emb = torch.cat((self.freqs, self.freqs), dim=-1).float()
+        else:
+            self._init_rope()
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -761,21 +764,28 @@ class HunYuanAttention(nn.Module):
                     value_states = self.v_proj(hidden_states)
                 orig_key_states, orig_value_states = key_states, value_states
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        kv_seq_len = value_states.shape[-2]
+
+        if self.use_fused_rope and self.training:
+            query_states = torch.rope(query_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+            key_states = torch.rope(key_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+        else:
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            if past_key_value is not None:
+                if self.layer_idx is None:
+                    raise ValueError(
+                        f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                        "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                        "with a layer index."
+                    )
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if self.use_qk_norm:
             query_states = self.query_layernorm(query_states)
@@ -884,15 +894,22 @@ class HunYuanFlashAttention2(HunYuanAttention):
         # Flash attention requires the input to have the shape
         # batch_size x seq_length x head_dim x hidden_dim
         # therefore we just need to keep the original shape
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        kv_seq_len = value_states.shape[-2]
+
+        if self.use_fused_rope and self.training:
+            query_states = torch.rope(query_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+            key_states = torch.rope(key_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+        else:
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            if past_key_value is not None:
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if self.use_qk_norm:
             query_states = self.query_layernorm(query_states)
@@ -1089,22 +1106,22 @@ class HunYuanSdpaAttention(HunYuanAttention):
                 value_states = self.v_proj(hidden_states)
             orig_key_states, orig_value_states = key_states, value_states
 
-        # query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # kv_seq_len = key_states.shape[-2]
         kv_seq_len = value_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        query_states = torch.rope(query_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
-        key_states = torch.rope(key_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
-        # print(f'!!!!!!!!!!! query_states {query_states.dtype}')
-        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        if self.use_fused_rope and self.training:
+            query_states = torch.rope(query_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+            key_states = torch.rope(key_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+        else:
+            query_states = query_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            if past_key_value is not None:
+                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if self.use_qk_norm:
             query_states = self.query_layernorm(query_states)
