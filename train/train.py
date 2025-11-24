@@ -32,7 +32,9 @@
 # limitations under the License.
 
 
+import torch_musa
 import os
+import time
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
@@ -42,6 +44,7 @@ import logging
 from dataclasses import dataclass, field
 import deepspeed
 from typing import Optional, Dict
+import numpy as np
 
 import transformers
 from torch.utils.data import Dataset
@@ -49,6 +52,11 @@ from transformers import Trainer, TrainerCallback
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.modeling_utils import unwrap_model
+
+tgs_list = []
+tflops_list = []
+mfu_list = []
+step_time_list = []
 
 
 def print_args(args, name='arguments'):
@@ -106,6 +114,9 @@ class ModelArguments:
     train_attention_params_only: bool = field(default=False, metadata={
         "help": "Whether to train attention parameters only."}
     )
+    use_pack_kv: bool = field(default=False, metadata={"help": "Whether to pack kv Linear"})
+    use_torch_rmsnorm: bool = field(default=False, metadata={"help": "Whether to use torch.rms_norm"})
+    use_swish_glu: bool = field(default=False, metadata={"help": "Whether to use torch.swish_glu"})
 
 
 @dataclass
@@ -174,6 +185,29 @@ class SFTDataset(Dataset):
         logging.info("there are {} data in dataset".format(len(data_list)))
         return data_list
 
+    # def encode_data(self, data_dict):
+    #     model_inputs = {}
+    #     message_tokens = torch.tensor(self.tokenizer.apply_chat_template(data_dict['messages']))
+    #     extra_0_token_id = self.tokenizer.convert_tokens_to_ids('<|extra_0|>')
+    #     eos_token_id = self.tokenizer.convert_tokens_to_ids('<|eos|>')
+    #     loss_token_begins = (message_tokens == extra_0_token_id).nonzero(as_tuple=True)[0].tolist()
+    #     loss_token_ends = (message_tokens == eos_token_id).nonzero(as_tuple=True)[0].tolist()
+    #     message_labels = torch.tensor([IGNORE_INDEX] * message_tokens.shape[0])
+    #     for begin_idx, end_idx in zip(loss_token_begins, loss_token_ends):
+    #         message_labels[begin_idx:end_idx + 1] = message_tokens[begin_idx:end_idx + 1]
+    #     input_ids = message_tokens.to(torch.long)
+    #     labels = message_labels.to(torch.long)
+
+    #     input_ids = input_ids[:self.max_seq_length]
+    #     labels = labels[:self.max_seq_length]
+    #     attention_mask = [1 if val != self.tokenizer.pad_id else 0 for val in input_ids]
+    #     model_inputs["input_ids"] = input_ids
+    #     model_inputs["attention_mask"] = torch.tensor(attention_mask, dtype=torch.bool)
+    #     model_inputs["labels"] = labels
+
+    #     return model_inputs
+    
+    # 右填充
     def encode_data(self, data_dict):
         model_inputs = {}
         message_tokens = torch.tensor(self.tokenizer.apply_chat_template(data_dict['messages']))
@@ -187,11 +221,33 @@ class SFTDataset(Dataset):
         input_ids = message_tokens.to(torch.long)
         labels = message_labels.to(torch.long)
 
+        # 截断超过最大长度的部分
         input_ids = input_ids[:self.max_seq_length]
         labels = labels[:self.max_seq_length]
-        attention_mask = [1 if val != self.tokenizer.pad_id else 0 for val in input_ids]
+        
+        # 获取当前序列长度
+        current_length = input_ids.shape[0]
+        
+        # 如果序列长度不足 max_seq_length，进行填充
+        if current_length < self.max_seq_length:
+            # 计算需要填充的长度
+            pad_length = self.max_seq_length - current_length
+            
+            # 为 input_ids 创建填充 (使用 tokenizer 的 pad_id)
+            pad_ids = torch.full((pad_length,), self.tokenizer.pad_id, dtype=torch.long)
+            input_ids = torch.cat([input_ids, pad_ids])
+            
+            # 为 labels 创建填充 (使用 IGNORE_INDEX，这样在计算损失时会忽略这些位置)
+            pad_labels = torch.full((pad_length,), IGNORE_INDEX, dtype=torch.long)
+            labels = torch.cat([labels, pad_labels])
+        
+        # 创建 attention mask: 1 表示真实 token，0 表示填充 token
+        attention_mask = torch.ones(self.max_seq_length, dtype=torch.bool)
+        if current_length < self.max_seq_length:
+            attention_mask[current_length:] = False  # 将填充部分标记为 False
+        
         model_inputs["input_ids"] = input_ids
-        model_inputs["attention_mask"] = torch.tensor(attention_mask, dtype=torch.bool)
+        model_inputs["attention_mask"] = attention_mask
         model_inputs["labels"] = labels
 
         return model_inputs
@@ -243,8 +299,10 @@ class CustomSaveCallback(TrainerCallback):
             output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
 
             # 拷贝tokenizer, 模型和配置文件
-            model_path = os.path.join(args.model_name_or_path, 'modeling_hunyuan.py')
-            config_path = os.path.join(args.model_name_or_path, 'configuration_hunyuan.py')
+            # model_path = os.path.join(args.model_name_or_path, 'modeling_hunyuan.py')
+            # config_path = os.path.join(args.model_name_or_path, 'configuration_hunyuan.py')
+            model_path = os.path.join('../models', 'modeling_hunyuan.py')
+            config_path = os.path.join('../models', 'configuration_hunyuan.py')
             shutil.copy(model_path, os.path.join(output_dir, 'modeling_hunyuan.py'))
             shutil.copy(config_path, os.path.join(output_dir, 'configuration_hunyuan.py'))
             shutil.copy(
@@ -275,11 +333,109 @@ class CustomSaveCallback(TrainerCallback):
                 json.dump(config, open(os.path.join(output_dir, "config.json"), 'w'), indent=2)
 
         return control
+    
+
+class MFUCallback(TrainerCallback):
+    def __init__(self, peak_flops_per_device, model_args, batch_size=4, seq_length=4096):
+        """
+        Args:
+            model_flops: 模型每次前向+反向传播的 FLOPs
+            peak_flops_per_device: 单个 GPU 的峰值 FLOPs (如 A100 312 TFLOPS = 312e12)
+        """
+        self.model_args = model_args
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.model_flops = self.estimate_model_flops()
+        self.peak_flops_per_device = peak_flops_per_device
+        self.start_time = None
+    
+    def estimate_model_flops(self):
+        """
+        估算 Transformer 模型每步 (前向+反向) 的 FLOPs
+        """
+        self.model_args.kv_channels = self.model_args.hidden_size / self.model_args.num_attention_heads
+        query_projection_size = self.model_args.kv_channels * self.model_args.num_attention_heads
+        query_projection_to_hidden_size_ratio = query_projection_size / self.model_args.hidden_size
+        # MoE.
+        # num_experts_routed_to = 1 if self.model_args.num_experts is None else self.model_args.moe_topk
+        num_experts_routed_to = 2 # 实际两个专家都用了
+        gated_linear_multiplier = 3 / 2 
+        shared_expert_ffn_hidden_size = self.model_args.intermediate_size / self.model_args.num_shared_expert
+        return (
+            12
+            * self.batch_size
+            * self.seq_length
+            * self.model_args.num_layers
+            * self.model_args.hidden_size
+            * self.model_args.hidden_size
+            * (
+                # Attention.
+                (
+                    (
+                        1
+                        + (self.model_args.num_key_value_heads / self.model_args.num_attention_heads * 0.5)
+                        + (self.seq_length / self.model_args.hidden_size)
+                    ) * query_projection_to_hidden_size_ratio
+                )
+                # MOE.
+                + (
+                    self.model_args.intermediate_size / self.model_args.hidden_size # Hunyuan-Large中专家的ffn size就是intermediate_size
+                    * num_experts_routed_to
+                    * gated_linear_multiplier
+                )
+                # Shared Experts.
+                + ((shared_expert_ffn_hidden_size / self.model_args.hidden_size) * gated_linear_multiplier)
+                # Logit.
+                + (self.model_args.vocab_size / (2 * self.model_args.num_layers * self.model_args.hidden_size))
+            )
+        )
+    
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.start_time is not None:
+            step_time = time.time() - self.start_time
+            
+            steps_per_sec = 1.0 / step_time
+            
+            # 计算实际 FLOPs/sec
+            flops_per_sec = self.model_flops * steps_per_sec / 1e12
+            
+            # # 考虑多设备
+            # total_peak_flops = self.peak_flops_per_device * torch.musa.device_count()
+            
+            # 计算 MFU
+            mfu = flops_per_sec / self.peak_flops_per_device
+            tgs = self.batch_size * self.seq_length / step_time
+            
+            # 记录到日志
+            # print(f"tokens/gpu/s: {tgs:.3f} | TFlops: {flops_per_sec:.3f} | MFU: {mfu:.2%} | Step time: {step_time:.3f}s | Steps/sec: {steps_per_sec:.2f}")
+            
+            # 可选：记录到 TensorBoard/W&B
+            # if hasattr(state, 'log_history'):
+            #     state.log_history.append({
+            #         'mfu': mfu,
+            #         'step_time': avg_step_time,
+            #         'steps_per_sec': steps_per_sec
+            #     })
+
+            tgs_list.append(tgs)
+            tflops_list.append(flops_per_sec)
+            mfu_list.append(mfu)
+            step_time_list.append(step_time)
+
+            self.start_time = None
+
 
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    seed = 1234
+    torch.manual_seed(seed)
+    torch.musa.manual_seed(seed)
+    torch.musa.manual_seed_all(seed)
     print_args(model_args, 'model arguments')
     print_args(data_args, 'data arguments')
     print_args(training_args, 'training arguments')
@@ -327,6 +483,9 @@ def train():
             use_qk_norm=model_args.use_qk_norm,
             model_type='hunyuan',
             tie_word_embeddings=model_args.tie_word_embeddings,
+            use_pack_kv=model_args.use_pack_kv,
+            use_torch_rmsnorm=model_args.use_torch_rmsnorm,
+            use_swish_glu=model_args.use_swish_glu,
             **init_kwargs
         )
         with deepspeed.zero.Init(dtype=init_kwargs["torch_dtype"], config_dict_or_path=training_args.deepspeed):
@@ -364,17 +523,30 @@ def train():
     training_args.lr_scheduler_kwargs = {
         'min_lr': training_args.min_lr,
     }
+    model_args.vocab_size = config.vocab_size
+    mfu_callback = MFUCallback(
+        peak_flops_per_device=430,
+        model_args=model_args,  # 您的模型配置
+        batch_size=training_args.per_device_train_batch_size,
+        seq_length=training_args.model_max_length  # 根据您的模型配置调整
+    )
 
     trainer = Trainer(
         model=model, 
         tokenizer=tokenizer, 
         args=training_args,
-        callbacks=[CustomSaveCallback],
+        callbacks=[CustomSaveCallback, mfu_callback],
         **data_module
     )
     model.config.use_cache = False
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+
+    avg_tgs = (sum(tgs_list) - tgs_list[0]) / (len(tgs_list) - 1)
+    avg_tflops = (sum(tflops_list) - tflops_list[0]) / (len(tflops_list) - 1)
+    avg_mfu = (sum(mfu_list) - mfu_list[0]) / (len(mfu_list) - 1)
+    avg_step_time = (sum(step_time_list) - step_time_list[0]) / (len(step_time_list) - 1)
+    print(f"end !! tokens/gpu/s: {avg_tgs:.3f} | TFlops: {avg_tflops:.3f} | MFU: {avg_mfu:.2%} | Step time: {avg_step_time:.3f}s")
 
 
 if __name__ == "__main__":
