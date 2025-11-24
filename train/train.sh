@@ -91,7 +91,7 @@ deepspeed --hostfile=$HOST_PATH --master_addr $CHIEF_IP train.py \
     --gradient_checkpointing \
     --lr_scheduler_type cosine_with_min_lr \
     --logging_steps 1 \
-    --max_steps 99 \
+    --max_steps 200 \
     --save_steps 100 \
     --learning_rate 1e-5 \
     --min_lr 1e-6 \
