@@ -49,7 +49,7 @@ train_data_file=/mnt/seed17/001688/wangwenxing/Tencent-Hunyuan-Large/AM-DeepSeek
 
 # ds_config_file=ds_zero2_no_offload.json
 # ds_config_file=ds_zero3_no_offload.json
-ds_config_file=ds_zero3_no_offload.json
+ds_config_file=ds_zero2_no_offload.json
 
 output_path=./hf_train_output
 
@@ -91,7 +91,7 @@ deepspeed --hostfile=$HOST_PATH --master_addr $CHIEF_IP train.py \
     --gradient_checkpointing \
     --lr_scheduler_type cosine_with_min_lr \
     --logging_steps 1 \
-    --max_steps 200 \
+    --max_steps 99 \
     --save_steps 100 \
     --learning_rate 1e-5 \
     --min_lr 1e-6 \

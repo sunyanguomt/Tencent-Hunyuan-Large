@@ -336,7 +336,6 @@ ALL_LAYERNORM_LAYERS.append(HunYuanRMSNorm)
 class HunYuanRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
@@ -658,14 +657,24 @@ class HunYuanAttention(nn.Module):
         if self.use_qk_norm:
             self.query_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
             self.key_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
+        self._init_rope_embeddings()
+
+    def _init_rope_embeddings(self):
+        """初始化 RoPE 相关的嵌入和缓冲区"""
         if self.use_fused_rope and self.training:
-            self.t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
-            self.inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-            self.inv_freq = self.inv_freq.bfloat16()
-            self.freqs = torch.outer(self.t, self.inv_freq)
-            # Different from paper, but it uses a different permutation in order to obtain the same calculation
-            self.emb = torch.cat((self.freqs, self.freqs), dim=-1).float()
+            # 创建频率张量
+            inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            
+            # 注册为缓冲区 - 这样它们会随模型移动到正确的设备
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            
+            t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
+            # 注意：这里不直接创建 emb，而是将其注册为缓冲区
+            freqs = torch.outer(t, self.inv_freq.to(t.device))
+            emb = torch.cat((freqs, freqs), dim=-1).float()
+            self.register_buffer("emb", emb.float(), persistent=False)
         else:
+            # 使用标准 RoPE 实现
             self._init_rope()
 
     def _init_rope(self):
@@ -901,8 +910,8 @@ class HunYuanFlashAttention2(HunYuanAttention):
         kv_seq_len = value_states.shape[-2]
 
         if self.use_fused_rope and self.training:
-            query_states = torch.rope(query_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
-            key_states = torch.rope(key_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+            query_states = torch.rope(query_states, freq_cis=self.emb[:kv_seq_len].float(), rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+            key_states = torch.rope(key_states, freq_cis=self.emb[:kv_seq_len].float(), rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
         else:
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
@@ -1113,8 +1122,8 @@ class HunYuanSdpaAttention(HunYuanAttention):
         kv_seq_len = value_states.shape[-2]
 
         if self.use_fused_rope and self.training:
-            query_states = torch.rope(query_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
-            key_states = torch.rope(key_states, freq_cis=self.emb, rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+            query_states = torch.rope(query_states, freq_cis=self.emb[:kv_seq_len].float(), rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
+            key_states = torch.rope(key_states, freq_cis=self.emb[:kv_seq_len].float(), rotary_interleaved=False, batch_first=True, multi_latent_attention=False).transpose(1, 2)
         else:
             query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
@@ -1143,6 +1152,8 @@ class HunYuanSdpaAttention(HunYuanAttention):
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with
         # custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        # 不需要contiguous
+        # if (query_states.device.type == "cuda" or query_states.device.type == "musa") and attention_mask is not None:
         if query_states.device.type == "cuda" and attention_mask is not None:
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
@@ -1156,7 +1167,8 @@ class HunYuanSdpaAttention(HunYuanAttention):
             dropout_p=self.attention_dropout if self.training else 0.0,
             # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a
             # causal mask in case q_len == 1.
-            is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            # is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            # is_causal = True,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -1584,6 +1596,11 @@ class HunYuanForCausalLM(HunYuanPreTrainedModel):
 
     def get_decoder(self):
         return self.model
+    
+    def custom_cross_entropy_1(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)  # 1. 计算对数概率
+        loss = F.nll_loss(log_probs, targets, reduction='mean')  # 2. 计算负对数似然损失
+        return loss
 
     @add_start_docstrings_to_model_forward(HUNYUAN_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1664,7 +1681,9 @@ class HunYuanForCausalLM(HunYuanPreTrainedModel):
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            # device = shift_logits.device
+            # loss = loss_fct(shift_logits, shift_labels)
+            loss = self.custom_cross_entropy_1(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

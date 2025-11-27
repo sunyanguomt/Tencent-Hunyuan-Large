@@ -440,11 +440,15 @@ def train():
     print_args(model_args, 'model arguments')
     print_args(data_args, 'data arguments')
     print_args(training_args, 'training arguments')
+    torch.random.default_generator = torch.Generator(device='cpu')
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         training_args.tokenizer_name_or_path,
         trust_remote_code = True
     )
+
+    use_fp8 = False
+    fp8_recipe = None
 
     init_kwargs = {}
     if model_args.use_flash_attn:
@@ -453,6 +457,65 @@ def train():
         init_kwargs["torch_dtype"] = torch.bfloat16
     elif training_args.fp16:
         init_kwargs["torch_dtype"] = torch.float16
+    elif use_fp8:
+        # FP8通常与BF16或FP16结合使用
+        init_kwargs["torch_dtype"] = torch.bfloat16
+        print("FP8 training enabled with bfloat16 compute dtype")
+
+    # === 修复 0: 添加FP8支持的导入 ===
+
+    if use_fp8:
+        try:
+            import transformer_engine as te
+            from transformer_engine.pytorch import fp8_autocast
+            from transformer_engine.common import recipe as te_recipe
+            print("Transformer Engine imported successfully, FP8 training enabled")
+            
+            # 配置FP8缩放策略
+            margin = getattr(training_args, 'fp8_margin', 0)
+            interval = getattr(training_args, 'fp8_interval', 1)
+            fp8_format = getattr(training_args, 'fp8_format', 'HYBRID')
+            amax_history_len = getattr(training_args, 'fp8_amax_history_len', 1024)
+            amax_compute_algo = getattr(training_args, 'fp8_amax_compute_algo', 'max')
+            
+            fp8_recipe = te_recipe.DelayedScaling(
+                margin=margin,
+                interval=interval,
+                fp8_format=te_recipe.Format[fp8_format],
+                amax_history_len=amax_history_len,
+                amax_compute_algo=amax_compute_algo
+            )
+        except ImportError as e:
+            print(f"Warning: Could not import transformer_engine: {e}")
+            print("FP8 training will be disabled")
+            use_fp8 = False
+
+    # === 修复 1: 读取 DeepSpeed 配置中的 ZeRO 阶段 ===
+    zero_stage = 0
+    if training_args.deepspeed:
+        import json
+        with open(training_args.deepspeed) as f:
+            ds_config = json.load(f)
+                    # === 修复 4: 在DeepSpeed配置中添加FP8支持 ===
+        if use_fp8 and "fp8" not in ds_config:
+            print("Adding FP8 configuration to DeepSpeed config")
+            ds_config["fp8"] = {
+                "enabled": True,
+                "margin": getattr(training_args, 'fp8_margin', 0),
+                "interval": getattr(training_args, 'fp8_interval', 1),
+                "fp8_format": getattr(training_args, 'fp8_format', 'HYBRID'),
+                "amax_history_len": getattr(training_args, 'fp8_amax_history_len', 1024),
+                "amax_compute_algo": getattr(training_args, 'fp8_amax_compute_algo', 'max')
+            }
+            # 保存修改后的配置
+            # import tempfile
+            # import json
+            # with tempfile.NamedTemporaryFile(mode='w+', suffix='.json', delete=False) as tmp_file:
+            #     json.dump(ds_config, tmp_file)
+            #     training_args.deepspeed = tmp_file.name
+            #     print(f"DeepSpeed config with FP8 saved to {training_args.deepspeed}")
+        zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
+        print(f"Detected DeepSpeed ZeRO stage: {zero_stage}")
 
     if training_args.model_name_or_path is not None and os.path.exists(training_args.model_name_or_path):
         print(f"Initializing model from local file: {training_args.model_name_or_path}")
@@ -490,8 +553,63 @@ def train():
             use_fused_rope=model_args.use_fused_rope,
             **init_kwargs
         )
-        with deepspeed.zero.Init(dtype=init_kwargs["torch_dtype"], config_dict_or_path=training_args.deepspeed):
+        
+        # === 修复 2: 根据 ZeRO 阶段选择正确的初始化方式 ===
+        if zero_stage == 3:
+            # ZeRO-3: 使用 deepspeed.zero.Init
+            print("Using ZeRO Stage 3 initialization")
+            with deepspeed.zero.Init(dtype=init_kwargs["torch_dtype"], config_dict_or_path=training_args.deepspeed):
+                model = HunYuanForCausalLM(config)
+        else:
+            # ZeRO-0/1/2: 标准初始化
+            print(f"Using standard initialization for ZeRO Stage {zero_stage}")
             model = HunYuanForCausalLM(config)
+
+    def replace_linears_with_te(model, parent_name=""):
+        """Recursively replace nn.Linear layers with TE.Linear layers"""
+            
+        for name, module in model.named_children():
+            full_name = f"{parent_name}.{name}" if parent_name else name
+            
+            if isinstance(module, torch.nn.Linear) and 'lm_head' not in name:
+                # Replace nn.Linear with TE.Linear
+                te_linear = te.Linear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None
+                )
+                # Copy weights and bias
+                te_linear.weight.data.copy_(module.weight.data)
+                if module.bias is not None:
+                    te_linear.bias.data.copy_(module.bias.data)
+                    
+                # Replace the module
+                setattr(model, name, te_linear)
+                print(f"Replaced {full_name} with TE.Linear")
+            else:
+                # Recursively process child modules
+                replace_linears_with_te(module, full_name)
+        
+        return model
+
+    def convert_to_fp8_training(model, use_te=True):
+        """Convert model for FP8 training"""
+        if use_te:
+            print("Converting model to use Transformer Engine layers for FP8 training")
+            model = replace_linears_with_te(model)
+        else:
+            print("Using standard FP8 autocast without layer replacement")
+        
+        return model
+
+        # === 修复 5: 如果启用FP8，替换模型中的线性层为TE层 ===
+    if use_fp8:
+        try:
+            print("Converting model to FP8-compatible layers")
+            model = convert_to_fp8_training(model, use_te=True)
+        except Exception as e:
+            print(f"Warning: Failed to convert model to FP8-compatible layers: {e}")
+            print("Continuing without FP8 layer conversion")
     
     if model_args.train_attention_params_only:
         for name, param in model.named_parameters():
@@ -513,7 +631,7 @@ def train():
     # 用 zero3 的时候不切分 MoE 参数
     if model_args.num_experts > 0 \
         and training_args.make_moe_param_leaf_module and \
-            training_args.deepspeed_plugin.zero_stage == 3:
+            zero_stage == 3:  # 修正这里，使用我们检测到的 zero_stage
         from deepspeed.utils import set_z3_leaf_modules
         set_z3_leaf_modules(model, [HunYuanMoE])
 
@@ -529,7 +647,7 @@ def train():
     mfu_callback = MFUCallback(
         peak_flops_per_device=430,
         model_args=model_args,  # 您的模型配置
-        batch_size=training_args.per_device_train_batch_size,
+        batch_size=training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps,
         seq_length=training_args.model_max_length  # 根据您的模型配置调整
     )
 
@@ -548,7 +666,7 @@ def train():
     avg_tflops = (sum(tflops_list) - tflops_list[0]) / (len(tflops_list) - 1)
     avg_mfu = (sum(mfu_list) - mfu_list[0]) / (len(mfu_list) - 1)
     avg_step_time = (sum(step_time_list) - step_time_list[0]) / (len(step_time_list) - 1)
-    print(f"end !! tokens/gpu/s: {avg_tgs:.3f} | TFlops: {avg_tflops:.3f} | MFU: {avg_mfu:.2%} | Step time: {avg_step_time:.3f}s")
+    print(f"end !! tokens/gpu/s: {avg_tgs:.3f} | TFlops: {avg_tflops:.3f} | MFU: {avg_mfu:.2%} | Step time: {avg_step_time:.3f}s") 
 
 
 if __name__ == "__main__":
