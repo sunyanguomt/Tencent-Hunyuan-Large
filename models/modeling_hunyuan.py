@@ -129,67 +129,84 @@ def topkgating(logits: Tensor, topk: int):
 
 
 def top1gating(logits: Tensor, random_routing_dropped_token: bool = False):
-    """Implements Top1Gating on logits."""
+    """Implements Top1Gating on logits with optimized performance."""
     # everything is in fp32 in this function
-    logits = logits.float()
-    gates = F.softmax(logits, dim=1)
+    gates = F.softmax(logits.float(), dim=1)
     capacity = gates.shape[0]
+    num_experts = gates.shape[1]
 
-    # Create a mask for 1st's expert per token
-    # noisy gating
+    # Get indices of top expert for each token
     indices1_s = torch.argmax(gates, dim=1)
-    num_experts = int(gates.shape[1])
-    mask1 = F.one_hot(indices1_s, num_classes=num_experts)
 
-    # gating decisions
-    # exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
-    exp_counts = torch.sum(mask1, dim=0).detach()
+    # Create mask directly without one_hot first
+    mask1 = torch.zeros_like(gates, dtype=torch.bool)
+    mask1.scatter_(1, indices1_s.unsqueeze(1), 1)
 
-    # Compute l_aux
+    # Compute expert counts and auxiliary loss
+    exp_counts = torch.sum(mask1, dim=0).detach()  # Keep detach if no gradient needed
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.float(), dim=0)
     l_aux = torch.sum(me * ce) * num_experts
-    mask1_rand = mask1
 
-    top_idx = torch.topk(mask1_rand, k=capacity, dim=0)[1]
+    # Apply capacity constraints more efficiently
+    # Get token indices for each expert
+    expert_token_indices = [torch.nonzero(mask1[:, i], as_tuple=True)[0] for i in range(num_experts)]
 
-    new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
+    # Create a new mask that respects capacity
+    new_mask1 = torch.zeros_like(mask1, dtype=torch.bool)
+    for expert_idx, token_indices in enumerate(expert_token_indices):
+        # Only keep top 'capacity' tokens for this expert
+        keep_indices = token_indices[:capacity]
+        if len(keep_indices) > 0:
+            new_mask1[keep_indices, expert_idx] = True
+
+    mask1_bk = new_mask1.clone()
     mask1 = new_mask1
-    mask1_bk = mask1
+
+    # Random routing for dropped tokens
     if random_routing_dropped_token:
-        not_full = capacity - new_mask1.sum(dim=0)
-        sorted_notfull, indices_notfull = torch.sort(not_full, descending=True)
-        sorted_notfull = sorted_notfull.to(torch.int64)
-        not_full_experts_ids = torch.repeat_interleave(indices_notfull, sorted_notfull)
-        shuffle_not_full_ids = torch.randperm(not_full_experts_ids.shape[0])
-        not_full_experts_ids = not_full_experts_ids[shuffle_not_full_ids]
-        indices1_s_after_drop = torch.argmax(new_mask1, dim=1)
-        # get drop idx
-        drop_mask = 1 - new_mask1.sum(dim=1)
-        drop_mask = drop_mask.bool()
-        drop_idx = drop_mask.nonzero().view(-1)
-        drop_num = drop_mask.sum().to(torch.int64)
-        indices1_s_after_drop.scatter_(0, drop_idx, not_full_experts_ids[:drop_num])
-        nodrop_mask1 = F.one_hot(indices1_s_after_drop, num_classes=num_experts)
-        mask1 = nodrop_mask1
+        # Identify dropped tokens
+        dropped_mask = ~torch.any(mask1, dim=1)
+        dropped_indices = torch.nonzero(dropped_mask, as_tuple=True)[0]
+        num_dropped = len(dropped_indices)
+
+        if num_dropped > 0:
+            # Find experts with remaining capacity
+            expert_loads = torch.sum(mask1, dim=0)
+            remaining_capacity = capacity - expert_loads
+            # Get experts with remaining capacity, in random order
+            available_experts = torch.repeat_interleave(
+                torch.arange(num_experts, device=gates.device),
+                remaining_capacity.to(torch.long)
+            )
+            if len(available_experts) > 0:
+                # Shuffle and select enough experts for dropped tokens
+                perm = torch.randperm(len(available_experts), device=gates.device)
+                selected_experts = available_experts[perm[:min(num_dropped, len(available_experts))]]
+
+                # Assign dropped tokens to these experts
+                for i, expert_idx in enumerate(selected_experts):
+                    if i >= num_dropped:
+                        break
+                    token_idx = dropped_indices[i]
+                    mask1[token_idx, expert_idx] = True
 
     # Compute locations in capacity buffer
     locations1 = torch.cumsum(mask1, dim=0) - 1
-
-    # Store the capacity location for each token
     locations1_s = torch.sum(locations1 * mask1, dim=1)
 
     # Normalize gate probabilities
-    mask1_float = mask1.float()
-    gates = gates * mask1_float
+    gates = gates * mask1
 
-    locations1_sc = F.one_hot(locations1_s, num_classes=capacity).float()   # one hot to float
-    combine_weights = torch.einsum("se,sc->sec", gates, locations1_sc)
-
-    dispatch_mask = combine_weights.bool()
+    # More efficient combine weights calculation
+    locations1_sc = torch.zeros((gates.shape[0], capacity), device=gates.device)
+    locations1_sc.scatter_(1, locations1_s.unsqueeze(1), 1.0)
+    combine_weights = gates.unsqueeze(2) * locations1_sc.unsqueeze(1)
+    dispatch_mask = (combine_weights > 0)
 
     exp_counts_capacity = torch.sum(mask1_bk)
-    exp_capacity_rate = exp_counts_capacity / (logits.shape[0])
+    exp_capacity_rate = exp_counts_capacity / logits.shape[0]
+
     return [l_aux, exp_capacity_rate], combine_weights, dispatch_mask, exp_counts
 
 
