@@ -243,8 +243,12 @@ class CustomSaveCallback(TrainerCallback):
             output_dir = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
 
             # 拷贝tokenizer, 模型和配置文件
-            model_path = os.path.join(args.model_name_or_path, 'modeling_hunyuan.py')
-            config_path = os.path.join(args.model_name_or_path, 'configuration_hunyuan.py')
+            if args.model_name_or_path is not None and os.path.exists(args.model_name_or_path):
+                model_path = os.path.join(args.model_name_or_path, 'modeling_hunyuan.py')
+                config_path = os.path.join(args.model_name_or_path, 'configuration_hunyuan.py')
+            else:
+                model_path = os.path.join('../models', 'modeling_hunyuan.py')
+                config_path = os.path.join('../models', 'configuration_hunyuan.py')
             shutil.copy(model_path, os.path.join(output_dir, 'modeling_hunyuan.py'))
             shutil.copy(config_path, os.path.join(output_dir, 'configuration_hunyuan.py'))
             shutil.copy(

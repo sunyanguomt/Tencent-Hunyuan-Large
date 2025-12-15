@@ -151,7 +151,9 @@ def top1gating(logits: Tensor, random_routing_dropped_token: bool = False):
     l_aux = torch.sum(me * ce) * num_experts
     mask1_rand = mask1
 
-    top_idx = torch.topk(mask1_rand, k=capacity, dim=0)[1]
+    # FIX ME(MUSA): TOPK  only suooprt Float32/Half/BFloat16
+    # top_idx = torch.topk(mask1_rand, k=capacity, dim=0)[1]
+    top_idx = torch.topk(mask1_rand.float(), k=capacity, dim=0)[1]
 
     new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
     mask1 = new_mask1
