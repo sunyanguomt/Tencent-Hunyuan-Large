@@ -101,6 +101,7 @@ deepspeed --num_gpus 8 train.py \
     --use_torch_rmsnorm \
     --use_swish_glu \
     --use_fused_rope \
+    --use_optimer_top1gating \
     --bf16 | tee ${log_file}
 
     # --gradient_checkpointing \

@@ -195,6 +195,88 @@ def top1gating(logits: Tensor, random_routing_dropped_token: bool = False):
     return [l_aux, exp_capacity_rate], combine_weights, dispatch_mask, exp_counts
 
 
+def optimer_top1gating(logits: Tensor, random_routing_dropped_token: bool = False):
+    """Implements Top1Gating on logits with optimized performance."""
+    # everything is in fp32 in this function
+    gates = F.softmax(logits.float(), dim=1)
+    capacity = gates.shape[0]
+    num_experts = gates.shape[1]
+
+    # Get indices of top expert for each token
+    indices1_s = torch.argmax(gates, dim=1)
+    
+    # Create mask directly without one_hot first
+    mask1 = torch.zeros_like(gates, dtype=torch.bool)
+    mask1.scatter_(1, indices1_s.unsqueeze(1), 1)
+    
+    # Compute expert counts and auxiliary loss
+    exp_counts = torch.sum(mask1, dim=0).detach()  # Keep detach if no gradient needed
+    me = torch.mean(gates, dim=0)
+    ce = torch.mean(mask1.float(), dim=0)
+    l_aux = torch.sum(me * ce) * num_experts
+    
+    # Apply capacity constraints more efficiently
+    # Get token indices for each expert
+    expert_token_indices = [torch.nonzero(mask1[:, i], as_tuple=True)[0] for i in range(num_experts)]
+    
+    # Create a new mask that respects capacity
+    new_mask1 = torch.zeros_like(mask1, dtype=torch.bool)
+    for expert_idx, token_indices in enumerate(expert_token_indices):
+        # Only keep top 'capacity' tokens for this expert
+        keep_indices = token_indices[:capacity]
+        if len(keep_indices) > 0:
+            new_mask1[keep_indices, expert_idx] = True
+    
+    mask1_bk = new_mask1.clone()
+    mask1 = new_mask1
+    
+    # Random routing for dropped tokens
+    if random_routing_dropped_token:
+        # Identify dropped tokens
+        dropped_mask = ~torch.any(mask1, dim=1)
+        dropped_indices = torch.nonzero(dropped_mask, as_tuple=True)[0]
+        num_dropped = len(dropped_indices)
+        
+        if num_dropped > 0:
+            # Find experts with remaining capacity
+            expert_loads = torch.sum(mask1, dim=0)
+            remaining_capacity = capacity - expert_loads
+            # Get experts with remaining capacity, in random order
+            available_experts = torch.repeat_interleave(
+                torch.arange(num_experts, device=gates.device), 
+                remaining_capacity.to(torch.long)
+            )
+            if len(available_experts) > 0:
+                # Shuffle and select enough experts for dropped tokens
+                perm = torch.randperm(len(available_experts), device=gates.device)
+                selected_experts = available_experts[perm[:min(num_dropped, len(available_experts))]]
+                
+                # Assign dropped tokens to these experts
+                for i, expert_idx in enumerate(selected_experts):
+                    if i >= num_dropped:
+                        break
+                    token_idx = dropped_indices[i]
+                    mask1[token_idx, expert_idx] = True
+    
+    # Compute locations in capacity buffer
+    locations1 = torch.cumsum(mask1, dim=0) - 1
+    locations1_s = torch.sum(locations1 * mask1, dim=1)
+    
+    # Normalize gate probabilities
+    gates = gates * mask1
+    
+    # More efficient combine weights calculation
+    locations1_sc = torch.zeros((gates.shape[0], capacity), device=gates.device)
+    locations1_sc.scatter_(1, locations1_s.unsqueeze(1), 1.0)
+    combine_weights = gates.unsqueeze(2) * locations1_sc.unsqueeze(1)
+    dispatch_mask = (combine_weights > 0)
+    
+    exp_counts_capacity = torch.sum(mask1_bk)
+    exp_capacity_rate = exp_counts_capacity / logits.shape[0]
+    
+    return [l_aux, exp_capacity_rate], combine_weights, dispatch_mask, exp_counts
+
+
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -456,6 +538,7 @@ class HunYuanTopKGate(nn.Module):
         self.min_capacity = 8
         self.random_routing_dropped_token = config.moe_random_routing_dropped_token
         self.wg = nn.Linear(config.hidden_size, config.num_experts, bias=False, dtype=torch.float32)
+        self.use_optimer_top1gating = config.use_optimer_top1gating
 
     def forward(self, hidden_states):
         bsz, seq_len, hidden_size = hidden_states.shape
@@ -464,7 +547,10 @@ class HunYuanTopKGate(nn.Module):
             hidden_states = hidden_states.float()
         logits = self.wg(hidden_states)
         if self.moe_topk == 1:
-            gate_output = top1gating(logits, random_routing_dropped_token=self.random_routing_dropped_token)
+            if self.use_optimer_top1gating:
+                gate_output = optimer_top1gating(logits, random_routing_dropped_token=self.random_routing_dropped_token)
+            else:
+                gate_output = top1gating(logits, random_routing_dropped_token=self.random_routing_dropped_token)
         else:
             gate_output = topkgating(logits, self.moe_topk)
 

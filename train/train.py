@@ -117,6 +117,7 @@ class ModelArguments:
     use_torch_rmsnorm: bool = field(default=False, metadata={"help": "Whether to use torch.rms_norm"})
     use_swish_glu: bool = field(default=False, metadata={"help": "Whether to use torch.swish_glu"})
     use_fused_rope: bool = field(default=False, metadata={"help": "Whether to use torch.rope"})
+    use_optimer_top1gating: bool = field(default=False, metadata={"help": "Whether to use optimer top1gating"})
 
 
 @dataclass
@@ -434,6 +435,7 @@ def train():
             use_torch_rmsnorm=model_args.use_torch_rmsnorm,
             use_swish_glu=model_args.use_swish_glu,
             use_fused_rope=model_args.use_fused_rope,
+            use_optimer_top1gating=model_args.use_optimer_top1gating,
             **init_kwargs
         )
         with deepspeed.zero.Init(dtype=init_kwargs["torch_dtype"], config_dict_or_path=training_args.deepspeed):
