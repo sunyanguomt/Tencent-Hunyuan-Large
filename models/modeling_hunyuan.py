@@ -537,6 +537,7 @@ class HunYuanAttention(nn.Module):
         self.rope_theta = config.rope_theta
         self.is_causal = True
         self.use_qk_norm = config.use_qk_norm
+        self.use_pack_kv = config.use_pack_kv
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -546,12 +547,18 @@ class HunYuanAttention(nn.Module):
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         if self.attention_type == 'self':
-            self.k_proj = nn.Linear(
-                self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-            )
-            self.v_proj = nn.Linear(
-                self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
-            )
+            # KV合并
+            if self.use_pack_kv:
+                self.kv_proj = nn.Linear(
+                    self.hidden_size, 2 * self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                )
+            else:
+                self.k_proj = nn.Linear(
+                    self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                )
+                self.v_proj = nn.Linear(
+                    self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         if self.use_qk_norm:
             self.query_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -644,8 +651,14 @@ class HunYuanAttention(nn.Module):
                 orig_key_states, orig_value_states = kv_states
                 key_states, value_states = kv_states
             else:
-                key_states = self.k_proj(hidden_states)
-                value_states = self.v_proj(hidden_states)
+                if self.use_pack_kv:
+                    kv_states = self.kv_proj(hidden_states)
+                    k_size = self.num_key_value_heads * self.head_dim
+                    key_states = kv_states[:, :, :k_size].contiguous()
+                    value_states = kv_states[:, :, k_size:].contiguous()
+                else:
+                    key_states = self.k_proj(hidden_states)
+                    value_states = self.v_proj(hidden_states)
                 orig_key_states, orig_value_states = key_states, value_states
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -758,8 +771,14 @@ class HunYuanFlashAttention2(HunYuanAttention):
             orig_key_states, orig_value_states = kv_states
             key_states, value_states = kv_states
         else:
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            if self.use_pack_kv:
+                kv_states = self.kv_proj(hidden_states)
+                k_size = self.num_key_value_heads * self.head_dim
+                key_states = kv_states[:, :, :k_size].contiguous()
+                value_states = kv_states[:, :, k_size:].contiguous()
+            else:
+                key_states = self.k_proj(hidden_states)
+                value_states = self.v_proj(hidden_states)
             orig_key_states, orig_value_states = key_states, value_states
 
         # Flash attention requires the input to have the shape
@@ -961,8 +980,14 @@ class HunYuanSdpaAttention(HunYuanAttention):
             orig_key_states, orig_value_states = kv_states
             key_states, value_states = kv_states
         else:
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            if self.use_pack_kv:
+                kv_states = self.kv_proj(hidden_states)
+                k_size = self.num_key_value_heads * self.head_dim
+                key_states = kv_states[:, :, :k_size].contiguous()
+                value_states = kv_states[:, :, k_size:].contiguous()
+            else:
+                key_states = self.k_proj(hidden_states)
+                value_states = self.v_proj(hidden_states)
             orig_key_states, orig_value_states = key_states, value_states
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)

@@ -97,6 +97,7 @@ deepspeed --num_gpus 8 train.py \
     --use_mixed_mlp_moe \
     --num_shared_expert 1 \
     --use_qk_norm \
+    --use_pack_kv \
     --bf16 | tee ${log_file}
 
     # --gradient_checkpointing \
