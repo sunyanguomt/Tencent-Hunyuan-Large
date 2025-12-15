@@ -33,6 +33,7 @@
 
 
 import os
+import time
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json
@@ -49,6 +50,12 @@ from transformers import Trainer, TrainerCallback
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.modeling_utils import unwrap_model
+
+tgs_list = []
+tflops_list = []
+mfu_list = []
+step_time_list = []
+
 
 
 def print_args(args, name='arguments'):
@@ -281,6 +288,94 @@ class CustomSaveCallback(TrainerCallback):
         return control
 
 
+class MFUCallback(TrainerCallback):
+    def __init__(self, peak_flops_per_device, model_args, batch_size=4, seq_length=4096):
+        """
+        Args:
+            model_flops: 模型每次前向+反向传播的 FLOPs
+            peak_flops_per_device: 单个 GPU 的峰值 FLOPs (如 A100 312 TFLOPS = 312e12)
+        """
+        self.model_args = model_args
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.model_flops = self.estimate_model_flops()
+        self.peak_flops_per_device = peak_flops_per_device
+        self.start_time = None
+    
+    def estimate_model_flops(self):
+        """
+        估算 Transformer 模型每步 (前向+反向) 的 FLOPs
+        """
+        self.model_args.kv_channels = self.model_args.hidden_size / self.model_args.num_attention_heads
+        query_projection_size = self.model_args.kv_channels * self.model_args.num_attention_heads
+        query_projection_to_hidden_size_ratio = query_projection_size / self.model_args.hidden_size
+        # MoE.
+        # num_experts_routed_to = 1 if self.model_args.num_experts is None else self.model_args.moe_topk
+        num_experts_routed_to = 2 # 实际两个专家都用了
+        gated_linear_multiplier = 3 / 2 
+        shared_expert_ffn_hidden_size = self.model_args.intermediate_size / self.model_args.num_shared_expert
+        return (
+            12
+            * self.batch_size
+            * self.seq_length
+            * self.model_args.num_layers
+            * self.model_args.hidden_size
+            * self.model_args.hidden_size
+            * (
+                # Attention.
+                (
+                    (
+                        1
+                        + (self.model_args.num_key_value_heads / self.model_args.num_attention_heads * 0.5)
+                        + (self.seq_length / self.model_args.hidden_size)
+                    ) * query_projection_to_hidden_size_ratio
+                )
+                # MOE.
+                + (
+                    self.model_args.intermediate_size / self.model_args.hidden_size # Hunyuan-Large中专家的ffn size就是intermediate_size
+                    * num_experts_routed_to
+                    * gated_linear_multiplier
+                )
+                # Shared Experts.
+                + ((shared_expert_ffn_hidden_size / self.model_args.hidden_size) * gated_linear_multiplier)
+                # Logit.
+                + (self.model_args.vocab_size / (2 * self.model_args.num_layers * self.model_args.hidden_size))
+            )
+        )
+    
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.start_time = time.time()
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.start_time is not None:
+            torch.distributed.barrier()
+            step_time = time.time() - self.start_time
+            
+            steps_per_sec = 1.0 / step_time
+            
+            # 计算实际 FLOPs/sec
+            flops_per_sec = self.model_flops * steps_per_sec / 1e12
+            
+            # # 考虑多设备
+            # total_peak_flops = self.peak_flops_per_device * torch.musa.device_count()
+            
+            # 计算 MFU
+            mfu = flops_per_sec / self.peak_flops_per_device
+            tgs = self.batch_size * self.seq_length / step_time
+            
+            # 每步记录到日志
+            # rank = torch.distributed.get_rank()
+            # print(f"tokens/gpu/s: {tgs:.3f} | TFlops: {flops_per_sec:.3f} | MFU: {mfu:.2%} | Step time: {step_time:.3f}s | Steps/sec: {steps_per_sec:.2f}")
+            
+
+            tgs_list.append(tgs)
+            tflops_list.append(flops_per_sec)
+            mfu_list.append(mfu)
+            step_time_list.append(step_time)
+
+            self.start_time = None
+
+
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -369,16 +464,31 @@ def train():
         'min_lr': training_args.min_lr,
     }
 
+    model_args.vocab_size = config.vocab_size
+    mfu_callback = MFUCallback(
+        peak_flops_per_device=430,
+        model_args=model_args,  # 您的模型配置
+        batch_size=training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps,
+        seq_length=training_args.model_max_length  # 根据您的模型配置调整
+    )
+
     trainer = Trainer(
         model=model, 
         tokenizer=tokenizer, 
         args=training_args,
-        callbacks=[CustomSaveCallback],
+        callbacks=[CustomSaveCallback, mfu_callback],
         **data_module
     )
     model.config.use_cache = False
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+
+    avg_tgs = (sum(tgs_list) - tgs_list[0]) / (len(tgs_list) - 1)
+    avg_tflops = (sum(tflops_list) - tflops_list[0]) / (len(tflops_list) - 1)
+    avg_mfu = (sum(mfu_list) - mfu_list[0]) / (len(mfu_list) - 1)
+    avg_step_time = (sum(step_time_list) - step_time_list[0]) / (len(step_time_list) - 1)
+    rank = torch.distributed.get_rank()
+    print(f"end !!rank {rank} !! tokens/gpu/s: {avg_tgs:.3f} | TFlops: {avg_tflops:.3f} | MFU: {avg_mfu:.2%} | Step time: {avg_step_time:.3f}s") 
 
 
 if __name__ == "__main__":
