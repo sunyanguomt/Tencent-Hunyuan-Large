@@ -228,20 +228,27 @@ def _make_causal_mask(
 
 
 class HunYuanRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps=1e-6, use_torch_rmsnorm=False):
         """
         HunYuanRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.use_torch_rmsnorm = use_torch_rmsnorm
 
     def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        if self.use_torch_rmsnorm:
+            return torch.nn.functional.rms_norm(hidden_states, 
+                                    normalized_shape=(hidden_states.shape[-1],),
+                                    weight=self.weight, 
+                                    eps=self.variance_epsilon)
+        else:
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(input_dtype)
 
 
 ALL_LAYERNORM_LAYERS.append(HunYuanRMSNorm)
@@ -538,6 +545,7 @@ class HunYuanAttention(nn.Module):
         self.is_causal = True
         self.use_qk_norm = config.use_qk_norm
         self.use_pack_kv = config.use_pack_kv
+        self.use_torch_rmsnorm = config.use_torch_rmsnorm
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -561,8 +569,8 @@ class HunYuanAttention(nn.Module):
                 )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         if self.use_qk_norm:
-            self.query_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.key_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.query_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
+            self.key_layernorm = HunYuanRMSNorm(self.head_dim, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
         self._init_rope()
 
     def _init_rope(self):
@@ -1057,6 +1065,7 @@ class HunYuanDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.use_torch_rmsnorm=config.use_torch_rmsnorm
 
         self.self_attn = HUNYUAN_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
@@ -1064,8 +1073,8 @@ class HunYuanDecoderLayer(nn.Module):
             self.mlp = HunYuanMoE(config, layer_idx=layer_idx)
         else:
             self.mlp = HunYuanMLP(config, layer_idx=layer_idx, is_shared_mlp=False)
-        self.input_layernorm = HunYuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = HunYuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = HunYuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
+        self.post_attention_layernorm = HunYuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
 
     def forward(
         self,
@@ -1272,7 +1281,8 @@ class HunYuanModel(HunYuanPreTrainedModel):
         )
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self.norm = HunYuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.use_torch_rmsnorm=config.use_torch_rmsnorm
+        self.norm = HunYuanRMSNorm(config.hidden_size, eps=config.rms_norm_eps, use_torch_rmsnorm=self.use_torch_rmsnorm)
 
         self.cla = config.use_cla
         self.cla_share_factor = config.cla_share_factor

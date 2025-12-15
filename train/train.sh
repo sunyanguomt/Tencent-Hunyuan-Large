@@ -98,6 +98,7 @@ deepspeed --num_gpus 8 train.py \
     --num_shared_expert 1 \
     --use_qk_norm \
     --use_pack_kv \
+    --use_torch_rmsnorm \
     --bf16 | tee ${log_file}
 
     # --gradient_checkpointing \
