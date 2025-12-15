@@ -76,7 +76,7 @@ deepspeed --num_gpus 8 train.py \
     --gradient_accumulation_steps 1 \
     --lr_scheduler_type cosine_with_min_lr \
     --logging_steps 1 \
-    --max_steps 10 \
+    --max_steps 200 \
     --save_steps 100 \
     --learning_rate 1e-5 \
     --min_lr 1e-6 \
