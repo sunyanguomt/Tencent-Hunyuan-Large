@@ -405,6 +405,14 @@ def train():
     elif training_args.fp16:
         init_kwargs["torch_dtype"] = torch.float16
 
+    zero_stage = 0
+    if training_args.deepspeed:
+        import json
+        with open(training_args.deepspeed) as f:
+            ds_config = json.load(f)
+        zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
+        print(f"Detected DeepSpeed ZeRO stage: {zero_stage}")
+
     if training_args.model_name_or_path is not None and os.path.exists(training_args.model_name_or_path):
         print(f"Initializing model from local file: {training_args.model_name_or_path}")
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -442,7 +450,14 @@ def train():
             use_optimer_top1gating=model_args.use_optimer_top1gating,
             **init_kwargs
         )
-        with deepspeed.zero.Init(dtype=init_kwargs["torch_dtype"], config_dict_or_path=training_args.deepspeed):
+        if zero_stage == 3:
+            # ZeRO-3: 使用 deepspeed.zero.Init
+            print("Using ZeRO Stage 3 initialization")
+            with deepspeed.zero.Init(dtype=init_kwargs["torch_dtype"], config_dict_or_path=training_args.deepspeed):
+                model = HunYuanForCausalLM(config)
+        else:
+            # ZeRO-0/1/2: 标准初始化
+            print(f"Using standard initialization for ZeRO Stage {zero_stage}")
             model = HunYuanForCausalLM(config)
     
     if model_args.train_attention_params_only:
