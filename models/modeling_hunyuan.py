@@ -414,6 +414,8 @@ class HunYuanMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self.use_swish_glu = config.use_swish_glu
+
 
     def forward(self, x):
         if self.config.pretraining_tp > 1:
@@ -433,7 +435,13 @@ class HunYuanMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            if self.use_swish_glu:
+                gate = self.gate_proj(x)
+                up = self.up_proj(x)
+                swish_glu_input = torch.cat((gate, up), dim=-1)
+                down_proj = self.down_proj(torch.swish_glu(swish_glu_input))
+            else:
+                down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
 
