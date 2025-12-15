@@ -113,6 +113,7 @@ class ModelArguments:
     train_attention_params_only: bool = field(default=False, metadata={
         "help": "Whether to train attention parameters only."}
     )
+    use_pack_kv: bool = field(default=False, metadata={"help": "Whether to pack kv Linear"})
 
 
 @dataclass
@@ -426,6 +427,7 @@ def train():
             use_qk_norm=model_args.use_qk_norm,
             model_type='hunyuan',
             tie_word_embeddings=model_args.tie_word_embeddings,
+            use_pack_kv=model_args.use_pack_kv,
             **init_kwargs
         )
         with deepspeed.zero.Init(dtype=init_kwargs["torch_dtype"], config_dict_or_path=training_args.deepspeed):
@@ -488,7 +490,7 @@ def train():
     avg_mfu = (sum(mfu_list) - mfu_list[0]) / (len(mfu_list) - 1)
     avg_step_time = (sum(step_time_list) - step_time_list[0]) / (len(step_time_list) - 1)
     rank = torch.distributed.get_rank()
-    print(f"end !!rank {rank} !! tokens/gpu/s: {avg_tgs:.3f} | TFlops: {avg_tflops:.3f} | MFU: {avg_mfu:.2%} | Step time: {avg_step_time:.3f}s") 
+    print(f"end !!rank {rank} !! tokens/gpu/s: {avg_tgs:.3f} | TFlops: {avg_tflops:.3f} | MFU: {avg_mfu:.2%} | Step time: {avg_step_time:.3f}s \n") 
 
 
 if __name__ == "__main__":
