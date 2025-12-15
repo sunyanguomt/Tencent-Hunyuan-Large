@@ -384,6 +384,10 @@ class MFUCallback(TrainerCallback):
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    seed = 1234
+    print_args(model_args, 'model arguments')
+    print_args(data_args, 'data arguments')
+    print_args(training_args, 'training arguments')
     print_args(model_args, 'model arguments')
     print_args(data_args, 'data arguments')
     print_args(training_args, 'training arguments')
