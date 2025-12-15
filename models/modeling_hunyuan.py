@@ -1168,11 +1168,12 @@ class HunYuanSdpaAttention(HunYuanAttention):
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask,
+            # attn_mask=attention_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a
             # causal mask in case q_len == 1.
-            is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            # is_causal=self.is_causal and attention_mask is None and q_len > 1,
+            is_causal=True,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
