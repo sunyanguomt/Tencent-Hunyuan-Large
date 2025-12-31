@@ -1,5 +1,18 @@
 #!/bin/bash
+set -e  # 遇到错误立即退出
+set -u  # 未定义变量时报错
 
+# 接收参数
+WORK_HOME=$1
+HOSTFILE=$2
+CURRENT_TIME=$3
+NODE_INDEX=$4
+HOST_NAME=$5
+set +u
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting training on $HOST_NAME (node index: $NODE_INDEX)"
+
+# 设置环境变量
 export TF_CPP_MIN_LOG_LEVEL=3
 export DS_ACCELERATOR=musa
 export LOGLEVEL="INFO"
@@ -29,42 +42,40 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib:/usr/lib/x86_64-linux-gnu:/usr/
 export TORCH_DIST_LOG_LEVEL=ERROR
 export DEEPSPEED_LOG_LEVEL=ERROR
 
-export HOST_GPU_NUM=8
-# 当前机器ip
-export LOCAL_IP=${10.202.43.46}
-# 多节点机器ip，逗号隔开
-export NODE_IP_LIST="${10.202.43.46}:8"
-# 机器节点个数
-export NODES=1
-export NODE_NUM=$((${NODES} * ${HOST_GPU_NUM}))
+export LM_HEAD_FP8=1
 
-export NCCL_DEBUG=WARN
+# export TORCH_PROFILING_TRACE=/data/yanguo.sun/Tencent-Hunyuan-Large/train/zero2_de_profiling
 
 # 给一个空目录，走else分支通过传参控制超参
 model_path=./models
 tokenizer_path=../models
-train_data_file=am_0.9M_sample_1k.jsonl
-
+train_data_file=am_0.9M.jsonl
 # ds_config_file=ds_zero2_no_offload.json
-ds_config_file=ds_zero3_no_offload.json
+ds_config_file=ds_zero2_no_offload.json
 # ds_config_file=ds_zero3_offload_no_auto.json
-
 output_path=./hf_train_output
 
-mkdir -p ${output_path}
+# 创建输出目录
+mkdir -p "$output_path"
+mkdir -p "$WORK_HOME/output_log"
 
-current_time=$(date "+%Y.%m.%d-%H.%M.%S")
-log_file=${output_path}/"log_${current_time}.txt"
 
-echo $NODE_IP_LIST > env.txt 2>&1 &
-sed "s/:/ slots=/g" env.txt | sed "s/,/\n/g" >  "hostfile"
-sed "s/:.//g" env.txt | sed "s/,/\n/g" >  "pssh.hosts"
-export CHIEF_IP=$LOCAL_IP
+export NODE_ADDR=$HOST_NAME
+export NUM_NODES=$(cat $HOSTFILE | wc -l)
+export MASTER_ADDR=$(head -n1 $HOSTFILE | awk '{print $1;}')
+export NODE_RANK=$(awk '{ranks[$1]=(FNR-1);}END{print ranks["'$NODE_ADDR'"];}' $HOSTFILE)
+export MASTER_PORT=14388
+DISTRIBUTED_ARGS=(
+    --nproc_per_node 8
+    --nnodes $NUM_NODES 
+    --node_rank $NODE_RANK 
+    --master_addr $MASTER_ADDR 
+    --master_port $MASTER_PORT
+    --log_dir $WORK_HOME/output_log/$CURRENT_TIME
+    --redirects ${LOG_REDIRECTS_LEVEL:-0} 
+)
 
-HOST_PATH=hostfile
-# HOST_PATH=none
-
-deepspeed --num_gpus 8 train.py \
+torchrun "${DISTRIBUTED_ARGS[@]}" "$WORK_HOME/train.py" \
     --do_train \
     --model_name_or_path ${model_path} \
     --tokenizer_name_or_path ${tokenizer_path} \
@@ -73,11 +84,11 @@ deepspeed --num_gpus 8 train.py \
     --output_dir ${output_path} \
     --overwrite_output_dir \
     --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 4 \
     --lr_scheduler_type cosine_with_min_lr \
     --logging_steps 1 \
-    --max_steps 10 \
-    --save_steps 100 \
+    --max_steps 50 \
+    --save_steps 1000 \
     --learning_rate 1e-5 \
     --min_lr 1e-6 \
     --warmup_ratio 0.01 \
@@ -99,10 +110,18 @@ deepspeed --num_gpus 8 train.py \
     --use_qk_norm \
     --use_pack_kv \
     --use_torch_rmsnorm \
-    --use_swish_glu \
     --use_fused_rope \
     --use_optimer_top1gating \
-    --bf16 | tee ${log_file}
+    --use_fp8 \
+    --full_determinism \
+    --data_seed 42 \
+    --bf16 \
+    --use_swish_glu \
+    # --precision_debug \
+
+
+    # --full_determinism \
+    # --data_seed 42 \
 
     # --gradient_checkpointing \
     # --use_lora \

@@ -580,13 +580,23 @@ class HunYuanMoE(nn.Module):
         l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states)
 
         reshaped_input = hidden_states.reshape(-1, hidden_size)
-
+        
         dispatched_input = torch.einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), reshaped_input)
-
+        
+        
         chunks = dispatched_input.chunk(self.num_experts, dim=0)
         expert_outputs = []
         for chunk, expert in zip(chunks, self.experts):
             expert_outputs.append(expert(chunk))
+
+        def check():
+            choices = (combine_weights.reshape(combine_weights.shape[0], -1).argmax(dim=-1)) // 8192
+            choices_cnt = torch.zeros_like(exp_counts)
+            for i in range(self.num_experts):
+                choices_cnt[i] = (choices == i).sum().item()
+            print(f"DEBUG: exp_counts = {exp_counts}", f"DEBUG: choices_cnt = {choices_cnt}")
+
+        # check()
 
         expert_output = torch.cat(expert_outputs, dim=0)
         combined_output = torch.einsum("sec,ecm->sm", combine_weights.type_as(hidden_states), expert_output)
@@ -597,6 +607,146 @@ class HunYuanMoE(nn.Module):
         else:
             output = combined_output
 
+        return output
+
+    def pytorch_permute(self, tokens, indices, num_out_tokens: int = None):
+        """
+        Permute the tokens based on the indices. Token with the same index will be grouped together.
+        The input indices shape is [tokens, top_k], it indicates which experts were selected by each token separately.
+
+        Args:
+            tokens: torch.Tensor
+                The input token tensor.
+            indices: torch.Tensor
+                The token to expert indices tensor, should have a shape of [num_tokens] or [num_tokens, topk].
+            num_out_tokens: int, optional
+                The effective output token count, when enabling the capacity factor, should equal the number of tokens not dropped.
+                By default, set to None, meaning no tokens are dropped.
+
+        Returns:
+            torch.Tensor:
+                The permuted tensor.
+            torch.Tensor:
+                The sorted_indices corresponding permuted tensor.
+        """
+
+        flatten_indices = indices.view(-1)
+        sorted_indices = torch.argsort(flatten_indices, stable=True)
+        permuted_tokens = tokens.index_select(0, sorted_indices[:num_out_tokens])
+        return permuted_tokens, sorted_indices
+
+
+    def pytorch_unpermute(
+        self,
+        permuted_tokens: torch.Tensor,
+        sorted_indices: torch.Tensor,
+        probs: torch.Tensor = None,
+    ):
+        """
+        Unpermute a tensor of permuted tokens based on sorted indices, and optionally merge the tokens with their
+        corresponding probabilities.
+
+        Args:
+            permuted_tokens: torch.Tensor
+                The tensor of permuted tokens to be unpermuted.
+            sorted_indices: torch.Tensor
+                The tensor of sorted indices used to unpermute the tokens.
+            probs: torch.Tensor, optional
+                The tensor of probabilities corresponding to the permuted tokens. If provided, the unpermuted tokens will
+                be merged with their respective probabilities.
+
+        Returns:
+            torch.Tensor:
+                The unpermuted tokens, optionally merged with probabilities.
+        """
+
+        if probs is not None:
+            # Unpermute and merge the tokens with their probabilities
+            num_unpermuted_tokens = probs.numel()
+            topk = probs.size(1)
+        else:
+            # Unpermute the tokens without merge
+            num_unpermuted_tokens = sorted_indices.size(0)
+            topk = 1
+        unpermuted_tokens = torch.zeros(
+            [num_unpermuted_tokens, permuted_tokens.shape[-1]],
+            dtype=permuted_tokens.dtype,
+            device=permuted_tokens.device,
+        )
+
+        unpermuted_tokens.index_copy_(0, sorted_indices[: permuted_tokens.size(0)], permuted_tokens)
+        unpermuted_tokens = unpermuted_tokens.reshape(-1, topk, permuted_tokens.size(-1))
+        if probs is not None:
+            unpermuted_tokens = unpermuted_tokens * probs.unsqueeze(-1).to(dtype=unpermuted_tokens.dtype)
+        unpermuted_tokens = unpermuted_tokens.sum(dim=1)
+        return unpermuted_tokens
+
+    def forward(self, hidden_states):
+        bsz, seq_len, hidden_size = hidden_states.shape
+        num_tokens = bsz * seq_len
+        original_shape = (bsz, seq_len, hidden_size)
+        
+        # 1. 原始门控计算
+        l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states)
+        # combine_weights 形状: [seq_len, num_experts, capacity] 或 [bsz*seq_len, num_experts, capacity]
+        
+        # 2. 展平输入并提取路由信息
+        reshaped_input = hidden_states.reshape(-1, hidden_size)
+        
+        # 对于top-1路由，提取每个token的专家分配 （hunyuan-large似乎是top-1）
+        if self.moe_topk == 1:
+            # 从combine_weights中提取主要专家索引
+            # 注意：根据你的实际实现，combine_weights的形状可能需要调整
+            expert_indices = torch.argmax(combine_weights.sum(dim=2), dim=1)  # [num_tokens]
+            
+            # 3. 使用pytorch_permute重排token
+            # 计算有效token数（考虑容量限制 有些token会在expert容量已满的情况下被分配给0个专家）
+            num_out_tokens = int(dispatch_mask.sum().item())
+
+            permuted_tokens, sorted_indices = self.pytorch_permute(
+                tokens=reshaped_input,
+                indices=expert_indices,
+                num_out_tokens=num_out_tokens
+            )
+            
+            # 4. 为每个专家计算输出
+            expert_outputs = []
+            start_idx = 0
+            
+            for expert_id in range(self.num_experts):
+                expert_token_count = exp_counts[expert_id].item()
+                
+                if expert_token_count > 0:
+                    expert_tokens = permuted_tokens[start_idx:start_idx + expert_token_count]
+                    expert_output = self.experts[expert_id](expert_tokens)
+                    expert_outputs.append(expert_output)
+                    start_idx += expert_token_count
+                else:
+                    # 添加空张量占位
+                    expert_outputs.append(torch.empty((0, hidden_size), 
+                                                    device=hidden_states.device,
+                                                    dtype=hidden_states.dtype))
+            
+            # 5. 拼接所有专家输出
+            combined_expert_output = torch.cat(expert_outputs, dim=0)  # [num_out_tokens, hidden_size]
+            
+            # 6. 使用pytorch_unpermute恢复原始顺序
+            restored_output = self.pytorch_unpermute(
+                permuted_tokens=combined_expert_output,
+                sorted_indices=sorted_indices,
+                probs=combine_weights.view(num_out_tokens, -1).sum(dim=-1, keepdim=True)
+            )  # 形状: [num_tokens, hidden_size]
+        
+        # 7. 恢复原始形状
+        combined_output = restored_output.reshape(original_shape)
+        
+        # 8. 与共享MLP结合（如果启用）
+        if self.config.use_mixed_mlp_moe:
+            hidden_states_mlp = self.shared_mlp(hidden_states)
+            output = hidden_states_mlp + combined_output
+        else:
+            output = combined_output
+        
         return output
 
 
