@@ -35,7 +35,10 @@ PADTOKEN = "<|pad|>"
 # as the default behavior is changed to allow special tokens in
 # regular texts, the surface forms of special tokens need to be
 # as different as possible to minimize the impact
-EXTRAS = tuple((f"<|extra_{i}|>" for i in range(204)))
+LM_HEAD_FP8 = os.getenv("LM_HEAD_FP8", "0")
+padding_range = 206 if LM_HEAD_FP8 == "1" else 204
+EXTRAS = tuple((f"<|extra_{i}|>" for i in range(padding_range)))
+# EXTRAS = tuple((f"<|extra_{i}|>" for i in range(204)))
 
 SPECIAL_START_ID = 127957
 
