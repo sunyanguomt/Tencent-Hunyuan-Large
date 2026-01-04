@@ -42,8 +42,6 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib:/usr/lib/x86_64-linux-gnu:/usr/
 export TORCH_DIST_LOG_LEVEL=ERROR
 export DEEPSPEED_LOG_LEVEL=ERROR
 
-export LM_HEAD_FP8=1
-
 # export TORCH_PROFILING_TRACE=/data/yanguo.sun/Tencent-Hunyuan-Large/train/zero2_de_profiling
 
 # 给一个空目录，走else分支通过传参控制超参
