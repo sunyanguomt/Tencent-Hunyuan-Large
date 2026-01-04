@@ -1,3 +1,23 @@
+## 快速开始
+```shell
+# 安装deepspeed
+git clone https://github.com/gliangMT/DeepSpeed.git
+cd DeepSpeed
+git checkout musa_dev
+DS_ACCELERATOR=musa DS_BUILD_FUSED_ADAM=1 DS_BUILD_CPU_ADAM=1 DS_BUILD_CPU_ADAGRAD=1 python setup.py develop
+cd ..
+
+git clone https://github.com/sunyanguomt/Tencent-Hunyuan-Large.git
+cd Tencent-Hunyuan-Large
+git checkout musa_dev
+pip install tiktoken
+pip install peft==0.12.0
+# 数据集  https://huggingface.co/datasets/a-m-team/AM-DeepSeek-R1-Distilled-1.4M 自行下载，放到train下
+
+# 使用fp8需要accelerate做一些修改具体参考https://github.com/sunyanguomt/accelerate/pull/1, 或直接使用https://github.com/sunyanguomt/accelerate
+# 采集profiling需要transformers添加采集功能
+```
+
 <p align="left">
     <a href="README_CN.md">中文</a>&nbsp ｜ English</a>
 </p>
