@@ -40,22 +40,21 @@ import json
 import torch
 import shutil
 import logging
+import random
+import numpy as np
 from dataclasses import dataclass, field
 import deepspeed
 from typing import Optional, Dict
-
 import transformers
 from torch.utils.data import Dataset
 from transformers import Trainer, TrainerCallback
 from peft import LoraConfig, get_peft_model, PeftModel
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-from transformers.modeling_utils import unwrap_model
 
 tgs_list = []
 tflops_list = []
 mfu_list = []
 step_time_list = []
-
 
 
 def print_args(args, name='arguments'):
@@ -113,11 +112,22 @@ class ModelArguments:
     train_attention_params_only: bool = field(default=False, metadata={
         "help": "Whether to train attention parameters only."}
     )
+    # MUSA 优化
     use_pack_kv: bool = field(default=False, metadata={"help": "Whether to pack kv Linear"})
     use_torch_rmsnorm: bool = field(default=False, metadata={"help": "Whether to use torch.rms_norm"})
     use_swish_glu: bool = field(default=False, metadata={"help": "Whether to use torch.swish_glu"})
     use_fused_rope: bool = field(default=False, metadata={"help": "Whether to use torch.rope"})
     use_optimer_top1gating: bool = field(default=False, metadata={"help": "Whether to use optimer top1gating"})
+    use_fp8: bool = field(default=False, metadata={"help": "FP8"})
+    # 精度调试
+    precision_debug: bool = field(default=False, metadata={"help": "Precision debug, if True, set seed"})
+    debug_seed: bool = field(default=42, metadata={"help": "random seed for precision debug"})
+    # FP8 相关参数
+    fp8_format: str = field(default="HYBRID", metadata={"help": "FP8 format, E4M3, E5M2 or HYBRID"})
+    fp8_amax_compute_algorithm: str = field(default="max", metadata={"help": "max or most_recent"})
+    fp8_amax_history_len: int = field(default=1024, metadata={"help": "FP8 amax history length"})
+    use_mxfp8_block_scaling: bool = field(default=False, metadata={"help": "Whether to use MXFP8 block scaling."})
+    lm_head_fp8: bool = field(default=True, metadata={"help": "Whether to use FP8 for LM head."})
 
 
 @dataclass
@@ -207,6 +217,51 @@ class SFTDataset(Dataset):
         model_inputs["labels"] = labels
 
         return model_inputs
+
+    # 右填充
+    # def encode_data(self, data_dict):
+    #     model_inputs = {}
+    #     message_tokens = torch.tensor(self.tokenizer.apply_chat_template(data_dict['messages']))
+    #     extra_0_token_id = self.tokenizer.convert_tokens_to_ids('<|extra_0|>')
+    #     eos_token_id = self.tokenizer.convert_tokens_to_ids('<|eos|>')
+    #     loss_token_begins = (message_tokens == extra_0_token_id).nonzero(as_tuple=True)[0].tolist()
+    #     loss_token_ends = (message_tokens == eos_token_id).nonzero(as_tuple=True)[0].tolist()
+    #     message_labels = torch.tensor([IGNORE_INDEX] * message_tokens.shape[0])
+    #     for begin_idx, end_idx in zip(loss_token_begins, loss_token_ends):
+    #         message_labels[begin_idx:end_idx + 1] = message_tokens[begin_idx:end_idx + 1]
+    #     input_ids = message_tokens.to(torch.long)
+    #     labels = message_labels.to(torch.long)
+
+    #     # 截断超过最大长度的部分
+    #     input_ids = input_ids[:self.max_seq_length]
+    #     labels = labels[:self.max_seq_length]
+        
+    #     # 获取当前序列长度
+    #     current_length = input_ids.shape[0]
+        
+    #     # 如果序列长度不足 max_seq_length，进行填充
+    #     if current_length < self.max_seq_length:
+    #         # 计算需要填充的长度
+    #         pad_length = self.max_seq_length - current_length
+            
+    #         # 为 input_ids 创建填充 (使用 tokenizer 的 pad_id)
+    #         pad_ids = torch.full((pad_length,), self.tokenizer.pad_id, dtype=torch.long)
+    #         input_ids = torch.cat([input_ids, pad_ids])
+            
+    #         # 为 labels 创建填充 (使用 IGNORE_INDEX，这样在计算损失时会忽略这些位置)
+    #         pad_labels = torch.full((pad_length,), IGNORE_INDEX, dtype=torch.long)
+    #         labels = torch.cat([labels, pad_labels])
+        
+    #     # 创建 attention mask: 1 表示真实 token，0 表示填充 token
+    #     attention_mask = torch.ones(self.max_seq_length, dtype=torch.bool)
+    #     if current_length < self.max_seq_length:
+    #         attention_mask[current_length:] = False  # 将填充部分标记为 False
+        
+    #     model_inputs["input_ids"] = input_ids
+    #     model_inputs["attention_mask"] = attention_mask
+    #     model_inputs["labels"] = labels
+
+    #     return model_inputs
 
     def __getitem__(self, index):
         data = self.data_list[index]
@@ -361,9 +416,6 @@ class MFUCallback(TrainerCallback):
             # 计算实际 FLOPs/sec
             flops_per_sec = self.model_flops * steps_per_sec / 1e12
             
-            # # 考虑多设备
-            # total_peak_flops = self.peak_flops_per_device * torch.musa.device_count()
-            
             # 计算 MFU
             mfu = flops_per_sec / self.peak_flops_per_device
             tgs = self.batch_size * self.seq_length / step_time
@@ -381,16 +433,53 @@ class MFUCallback(TrainerCallback):
             self.start_time = None
 
 
+def set_seed(seed, training_args):
+    """设置所有随机种子确保可复现性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.musa.manual_seed(seed)
+    torch.musa.manual_seed_all(seed)  # 多GPU时
+    torch.backends.mudnn.deterministic = True
+    torch.backends.mudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    
+    # 如果使用DeepSpeed，还需要设置deepspeed的随机种子
+    if training_args.deepspeed:
+        os.environ['RANDOM_SEED'] = str(seed)
+        os.environ['PL_GLOBAL_SEED'] = str(seed)
+
+
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    seed = 1234
-    print_args(model_args, 'model arguments')
-    print_args(data_args, 'data arguments')
-    print_args(training_args, 'training arguments')
-    print_args(model_args, 'model arguments')
-    print_args(data_args, 'data arguments')
-    print_args(training_args, 'training arguments')
+    if model_args.precision_debug:
+        seed = model_args.debug_seed
+        set_seed(seed, training_args)
+    
+    if model_args.precision_debug or model_args.use_fp8:
+        # fixme(musa): generator only create in musa on fp8 mode
+        default_generator = torch.Generator(device='cpu')
+        if model_args.precision_debug:
+            default_generator.manual_seed(seed)
+        torch.random.default_generator = default_generator
+
+    if model_args.use_fp8:
+        if model_args.fp8_format not in ["E4M3", "E5M2", "HYBRID"]:
+            raise ValueError("fp8_format must be one of E4M3, E5M2 or HYBRID")
+        if model_args.fp8_amax_compute_algorithm not in ["max", "most_recent"]:
+            raise ValueError("fp8_amax_compute_algorithm must be one of max or most_recent")
+        if model_args.use_mxfp8_block_scaling:
+            os.environ["ACCELERATE_FP8_USE_MXFP8_BLOCK_SCALING"] = "true"
+        os.environ["ACCELERATE_MIXED_PRECISION"] = "fp8"
+        os.environ["ACCELERATE_FP8_FORMAT"] = model_args.fp8_format
+        os.environ["ACCELERATE_FP8_AMAX_COMPUTE_ALGORITHM"] = model_args.fp8_amax_compute_algorithm
+        os.environ["ACCELERATE_FP8_AMAX_HISTORY_LEN"] = str(model_args.fp8_amax_history_len)
+
+        # LM_HEAD FP8
+        if model_args.lm_head_fp8:
+            os.environ["LM_HEAD_FP8"] = "1"
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         training_args.tokenizer_name_or_path,
@@ -413,6 +502,10 @@ def train():
         zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
         print(f"Detected DeepSpeed ZeRO stage: {zero_stage}")
 
+    print_args(model_args, 'model arguments')
+    print_args(data_args, 'data arguments')
+    print_args(training_args, 'training arguments')
+
     if training_args.model_name_or_path is not None and os.path.exists(training_args.model_name_or_path):
         print(f"Initializing model from local file: {training_args.model_name_or_path}")
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -427,7 +520,7 @@ def train():
               use random initialized model instead.")
         # 定义模型
         config = HunYuanConfig(
-            vocab_size=tokenizer.vocab_size,  # 词表大小
+            vocab_size=tokenizer.vocab_size,  # 词表大小 
             hidden_size=model_args.hidden_size,        # 隐藏层大小
             intermediate_size=model_args.intermediate_size,  # FFN 层大小
             max_position_embeddings=training_args.model_max_length,   # 最大序列长度
