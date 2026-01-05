@@ -81,11 +81,11 @@ torchrun "${DISTRIBUTED_ARGS[@]}" "$WORK_HOME/train.py" \
     --deepspeed ${ds_config_file} \
     --output_dir ${output_path} \
     --overwrite_output_dir \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 4 \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 1 \
     --lr_scheduler_type cosine_with_min_lr \
     --logging_steps 1 \
-    --max_steps 20 \
+    --max_steps 50 \
     --save_steps 1000 \
     --learning_rate 1e-5 \
     --min_lr 1e-6 \
@@ -111,9 +111,11 @@ torchrun "${DISTRIBUTED_ARGS[@]}" "$WORK_HOME/train.py" \
     --use_swish_glu \
     --use_fused_rope \
     --use_optimer_top1gating \
+    --use_permute \
     --use_fp8 \
-    --fp8_format E4M3 \
-    --use_mxfp8_block_scaling \
+    --fp8_format HYBRID \
+    --fp8_amax_compute_algorithm most_recent \
+    --fp8_amax_history_len 32 \
     --lm_head_fp8 \
     --bf16 \
 

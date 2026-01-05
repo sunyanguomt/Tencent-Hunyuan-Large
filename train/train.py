@@ -118,6 +118,7 @@ class ModelArguments:
     use_swish_glu: bool = field(default=False, metadata={"help": "Whether to use torch.swish_glu"})
     use_fused_rope: bool = field(default=False, metadata={"help": "Whether to use torch.rope"})
     use_optimer_top1gating: bool = field(default=False, metadata={"help": "Whether to use optimer top1gating"})
+    use_permute: bool = field(default=False, metadata={"help": "Whether to permute/unpermute"})
     use_fp8: bool = field(default=False, metadata={"help": "FP8"})
     # 精度调试
     precision_debug: bool = field(default=False, metadata={"help": "Precision debug, if True, set seed"})
@@ -196,29 +197,6 @@ class SFTDataset(Dataset):
         logging.info("there are {} data in dataset".format(len(data_list)))
         return data_list
 
-    def encode_data(self, data_dict):
-        model_inputs = {}
-        message_tokens = torch.tensor(self.tokenizer.apply_chat_template(data_dict['messages']))
-        extra_0_token_id = self.tokenizer.convert_tokens_to_ids('<|extra_0|>')
-        eos_token_id = self.tokenizer.convert_tokens_to_ids('<|eos|>')
-        loss_token_begins = (message_tokens == extra_0_token_id).nonzero(as_tuple=True)[0].tolist()
-        loss_token_ends = (message_tokens == eos_token_id).nonzero(as_tuple=True)[0].tolist()
-        message_labels = torch.tensor([IGNORE_INDEX] * message_tokens.shape[0])
-        for begin_idx, end_idx in zip(loss_token_begins, loss_token_ends):
-            message_labels[begin_idx:end_idx + 1] = message_tokens[begin_idx:end_idx + 1]
-        input_ids = message_tokens.to(torch.long)
-        labels = message_labels.to(torch.long)
-
-        input_ids = input_ids[:self.max_seq_length]
-        labels = labels[:self.max_seq_length]
-        attention_mask = [1 if val != self.tokenizer.pad_id else 0 for val in input_ids]
-        model_inputs["input_ids"] = input_ids
-        model_inputs["attention_mask"] = torch.tensor(attention_mask, dtype=torch.bool)
-        model_inputs["labels"] = labels
-
-        return model_inputs
-
-    # 右填充
     # def encode_data(self, data_dict):
     #     model_inputs = {}
     #     message_tokens = torch.tensor(self.tokenizer.apply_chat_template(data_dict['messages']))
@@ -232,36 +210,59 @@ class SFTDataset(Dataset):
     #     input_ids = message_tokens.to(torch.long)
     #     labels = message_labels.to(torch.long)
 
-    #     # 截断超过最大长度的部分
     #     input_ids = input_ids[:self.max_seq_length]
     #     labels = labels[:self.max_seq_length]
-        
-    #     # 获取当前序列长度
-    #     current_length = input_ids.shape[0]
-        
-    #     # 如果序列长度不足 max_seq_length，进行填充
-    #     if current_length < self.max_seq_length:
-    #         # 计算需要填充的长度
-    #         pad_length = self.max_seq_length - current_length
-            
-    #         # 为 input_ids 创建填充 (使用 tokenizer 的 pad_id)
-    #         pad_ids = torch.full((pad_length,), self.tokenizer.pad_id, dtype=torch.long)
-    #         input_ids = torch.cat([input_ids, pad_ids])
-            
-    #         # 为 labels 创建填充 (使用 IGNORE_INDEX，这样在计算损失时会忽略这些位置)
-    #         pad_labels = torch.full((pad_length,), IGNORE_INDEX, dtype=torch.long)
-    #         labels = torch.cat([labels, pad_labels])
-        
-    #     # 创建 attention mask: 1 表示真实 token，0 表示填充 token
-    #     attention_mask = torch.ones(self.max_seq_length, dtype=torch.bool)
-    #     if current_length < self.max_seq_length:
-    #         attention_mask[current_length:] = False  # 将填充部分标记为 False
-        
+    #     attention_mask = [1 if val != self.tokenizer.pad_id else 0 for val in input_ids]
     #     model_inputs["input_ids"] = input_ids
-    #     model_inputs["attention_mask"] = attention_mask
+    #     model_inputs["attention_mask"] = torch.tensor(attention_mask, dtype=torch.bool)
     #     model_inputs["labels"] = labels
 
     #     return model_inputs
+
+    # 右填充
+    def encode_data(self, data_dict):
+        model_inputs = {}
+        message_tokens = torch.tensor(self.tokenizer.apply_chat_template(data_dict['messages']))
+        extra_0_token_id = self.tokenizer.convert_tokens_to_ids('<|extra_0|>')
+        eos_token_id = self.tokenizer.convert_tokens_to_ids('<|eos|>')
+        loss_token_begins = (message_tokens == extra_0_token_id).nonzero(as_tuple=True)[0].tolist()
+        loss_token_ends = (message_tokens == eos_token_id).nonzero(as_tuple=True)[0].tolist()
+        message_labels = torch.tensor([IGNORE_INDEX] * message_tokens.shape[0])
+        for begin_idx, end_idx in zip(loss_token_begins, loss_token_ends):
+            message_labels[begin_idx:end_idx + 1] = message_tokens[begin_idx:end_idx + 1]
+        input_ids = message_tokens.to(torch.long)
+        labels = message_labels.to(torch.long)
+
+        # 截断超过最大长度的部分
+        input_ids = input_ids[:self.max_seq_length]
+        labels = labels[:self.max_seq_length]
+        
+        # 获取当前序列长度
+        current_length = input_ids.shape[0]
+        
+        # 如果序列长度不足 max_seq_length，进行填充
+        if current_length < self.max_seq_length:
+            # 计算需要填充的长度
+            pad_length = self.max_seq_length - current_length
+            
+            # 为 input_ids 创建填充 (使用 tokenizer 的 pad_id)
+            pad_ids = torch.full((pad_length,), self.tokenizer.pad_id, dtype=torch.long)
+            input_ids = torch.cat([input_ids, pad_ids])
+            
+            # 为 labels 创建填充 (使用 IGNORE_INDEX，这样在计算损失时会忽略这些位置)
+            pad_labels = torch.full((pad_length,), IGNORE_INDEX, dtype=torch.long)
+            labels = torch.cat([labels, pad_labels])
+        
+        # 创建 attention mask: 1 表示真实 token，0 表示填充 token
+        attention_mask = torch.ones(self.max_seq_length, dtype=torch.bool)
+        if current_length < self.max_seq_length:
+            attention_mask[current_length:] = False  # 将填充部分标记为 False
+        
+        model_inputs["input_ids"] = input_ids
+        model_inputs["attention_mask"] = attention_mask
+        model_inputs["labels"] = labels
+
+        return model_inputs
 
     def __getitem__(self, index):
         data = self.data_list[index]
@@ -541,6 +542,7 @@ def train():
             use_swish_glu=model_args.use_swish_glu,
             use_fused_rope=model_args.use_fused_rope,
             use_optimer_top1gating=model_args.use_optimer_top1gating,
+            use_permute=model_args.use_permute,
             **init_kwargs
         )
         if zero_stage == 3:
