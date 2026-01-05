@@ -570,6 +570,7 @@ class HunYuanMoE(nn.Module):
         self.experts = nn.ModuleList(
             [HunYuanMLP(config, layer_idx=layer_idx, is_shared_mlp=False) for _ in range(config.num_experts)]
         )
+        self.use_permute = config.use_permute
 
     def pytorch_permute(self, tokens, indices, num_out_tokens: int = None):
         """
@@ -651,7 +652,7 @@ class HunYuanMoE(nn.Module):
         l_moe, combine_weights, dispatch_mask, exp_counts = self.gate(hidden_states)
 
         reshaped_input = hidden_states.reshape(-1, hidden_size)
-        if not self.use_permute_unpermute:
+        if not self.use_permute:
             dispatched_input = torch.einsum("sec,sm->ecm", dispatch_mask.type_as(hidden_states), reshaped_input)
             
             
@@ -700,14 +701,14 @@ class HunYuanMoE(nn.Module):
                 combined_expert_output = torch.cat(expert_outputs, dim=0)  # [num_out_tokens, hidden_size]
                 
                 # 6. 使用pytorch_unpermute恢复原始顺序
-                restored_output = self.pytorch_unpermute(
+                combined_output = self.pytorch_unpermute(
                     permuted_tokens=combined_expert_output,
                     sorted_indices=sorted_indices,
                     probs=combine_weights.view(num_out_tokens, -1).sum(dim=-1, keepdim=True)
                 )  # 形状: [num_tokens, hidden_size]
             else:
                 raise NotImplementedError("Only top-1 routing is implemented.")
-        combined_output = restored_output.reshape(bsz, seq_len, hidden_size)
+        combined_output = combined_output.reshape(bsz, seq_len, hidden_size)
 
         if self.config.use_mixed_mlp_moe:
             output = hidden_states_mlp + combined_output
