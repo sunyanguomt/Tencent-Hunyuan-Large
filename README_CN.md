@@ -15,7 +15,21 @@ pip install peft==0.12.0
 # 数据集  https://huggingface.co/datasets/a-m-team/AM-DeepSeek-R1-Distilled-1.4M 自行下载，放到train下
 
 # 使用fp8需要accelerate做一些修改具体参考https://github.com/sunyanguomt/accelerate/pull/1, 或直接使用https://github.com/sunyanguomt/accelerate
+pip uninstall mlflow
+# 规避一个torch的问题, 修改参照如下
+# vi /usr/local/lib/python3.10/dist-packages/torch/utils/data/sampler.py +181
+    # def __iter__(self) -> Iterator[int]:
+    #     n = len(self.data_source)
+    #     if self.generator is None:
+    #         seed = int(torch.empty((), dtype=torch.int64).random_().item())
+    #         generator = torch.Generator()
+    #         generator.manual_seed(seed)
+    #     else:
+    #         generator = self.generator
+    #     generator = torch.random.default_generator
+
 # 采集profiling需要transformers添加采集功能
+
 ```
 
 
